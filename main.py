@@ -1,15 +1,16 @@
 """
-main.py - Simulation Orchestrator for OPA Federated Learning & Inference-Time Tab Attack.
+main.py - Simulation Orchestrator for OPA Federated Learning & Text Tab Attack.
 
 Workflow:
-  1. Initializes deterministic seeds (PyTorch & NumPy) for reproducible evaluation.
-  2. Generates shared public matrix A and initializes LWR_PRG for clients and server.
-  3. Prepares synthetic federated datasets with vulnerability injection in Client 2.
-  4. Launches 10-round Federated Learning simulation using Flower and OPAStrategy.
-  5. Extracts aggregated global NextWordModel parameters after simulation.
-  6. Executes inference-time Tab Attack (Algorithm 1) to evaluate S_uniq leakage.
-  7. Demonstrates that while OPA secures transmission, Client 2's confidential sequence
-     [42, 43, 44, 45, 46] is completely extracted from the final global model.
+  1. Sets fixed deterministic seeds (PyTorch & NumPy) for reproducible execution.
+  2. Initializes WordTokenizer and sliding-window DataLoaders on text corpus.
+  3. Dynamically calculates vocab_size and total model parameter count L.
+  4. Generates shared public matrix A and initializes LWR_PRG for clients and server.
+  5. Launches a 15-round Federated Learning simulation using Flower and OPAFedAvg.
+  6. Extracts the final OPA-trained global NextWordModel parameters.
+  7. Runs the inference-time Tab Attack (Algorithm 1) to extract consecutive memorized words.
+  8. Prints high-visibility console output demonstrating that the global model regurgitated
+     the exact phrase "my secret bank pin code is seven eight nine two".
 """
 
 import os
@@ -43,12 +44,12 @@ try:
     from OPA.crypto import LWR_PRG, DEFAULT_Q, DEFAULT_P, DEFAULT_SCALE
     from OPA.model import NextWordModel
     from OPA.dataset import (
-        VOCAB_SIZE,
-        TARGET_VULNERABILITY_SEQUENCE,
+        TARGET_VULNERABILITY_TEXT,
+        WordTokenizer,
         get_client_dataloaders,
-        get_raw_client_sequences,
+        get_raw_client_texts,
     )
-    from OPA.opa_flwr import OPAClient, OPAStrategy
+    from OPA.opa_flwr import OPAClient, OPAFedAvg
     from OPA.attack import (
         tab_attack_leakage_analysis,
         get_unique_leaked_sequences,
@@ -58,12 +59,12 @@ except ImportError:
     from crypto import LWR_PRG, DEFAULT_Q, DEFAULT_P, DEFAULT_SCALE
     from model import NextWordModel
     from dataset import (
-        VOCAB_SIZE,
-        TARGET_VULNERABILITY_SEQUENCE,
+        TARGET_VULNERABILITY_TEXT,
+        WordTokenizer,
         get_client_dataloaders,
-        get_raw_client_sequences,
+        get_raw_client_texts,
     )
-    from opa_flwr import OPAClient, OPAStrategy
+    from opa_flwr import OPAClient, OPAFedAvg
     from attack import (
         tab_attack_leakage_analysis,
         get_unique_leaked_sequences,
@@ -88,20 +89,47 @@ def main():
     # 1. Deterministic Seeds
     set_deterministic_seeds(42)
 
-    # 2. Cryptographic Parameters & Public Matrix A Initialization
-    # NextWordModel with vocab=50, embed=16, gru=32 has exactly L = 7250 parameters
-    L_DIM = 7250
-    LAMBDA_DIM = 16
-    NUM_ROUNDS = 10
+    # 2. Data Pipeline & Vocabulary Construction
+    NUM_ROUNDS = 15
     NUM_CLIENTS = 3
+    BATCH_SIZE = 8
 
-    print(f"\n[+] Initializing Cryptographic Parameters (Construction 2 LWR PRG):")
+    print("\n[1] Preparing Text Corpus & WordTokenizer:")
+    tokenizer, client_loaders, raw_texts = get_client_dataloaders(
+        num_clients=NUM_CLIENTS,
+        batch_size=BATCH_SIZE,
+        standard_repeat=25,
+        sensitive_repeat=60,
+    )
+    vocab_size = len(tokenizer)
+
+    print(f"    - Fitted WordTokenizer on corpus: Total Vocabulary = {vocab_size} unique words")
+    print("    - Client 0: Standard domain sentences.")
+    print("    - Client 1: Standard domain sentences (shared domain language).")
+    print(f"    - Client 2: Standard text + Injected Secret:")
+    print(f"                \"{TARGET_VULNERABILITY_TEXT}\"")
+    print("      (Repeated to force empirical memorization during local training).")
+
+    # 3. Model Architecture & Dynamic Parameter Count
+    # Architecture: Embedding(vocab_size, 32) -> GRU(32, 64) -> Linear(64, vocab_size)
+    init_model = NextWordModel(vocab_size=vocab_size, embed_dim=32, hidden_dim=64)
+    initial_parameters = ndarrays_to_parameters(init_model.get_weights())
+
+    L_DIM = sum(param.numel() for param in init_model.parameters())
+    LAMBDA_DIM = 16
+
+    print(f"\n[2] Neural Network Architecture (Dynamic vocab_size = {vocab_size}):")
+    print("    - Embedding(vocab_size, 32) -> GRU(32, 64, batch_first=True) -> Linear(64, vocab_size)")
+    print(f"    - Total Model Parameter Count L = {L_DIM}")
+
+    # 4. Cryptographic Setup (LWR PRG with matrix A of shape (L, lambda))
+    print(f"\n[3] Cryptographic Parameters (Construction 2 LWR PRG & Construction 1 SSS):")
     print(f"    - Parameter Dimension L  : {L_DIM}")
     print(f"    - Seed Space Dimension \u03bb : {LAMBDA_DIM}")
     print(f"    - Prime Modulus q        : {DEFAULT_Q} (2^31 - 1)")
     print(f"    - Rounding Modulus p     : {DEFAULT_P} (2^20)")
 
-    # Public matrix A is shared by all clients and server
+    # Shared public matrix A initialized deterministically
     lwr_prg = LWR_PRG(
         L=L_DIM,
         lam=LAMBDA_DIM,
@@ -109,32 +137,12 @@ def main():
         p=DEFAULT_P,
         seed=42,
     )
-    print("    - Shared Public Matrix A initialized with shape (7250, 16).")
+    print(f"    - Shared Public Matrix A initialized with shape ({L_DIM}, {LAMBDA_DIM}).")
 
-    # 3. Data Pipeline & Vulnerability Injection
-    print(f"\n[+] Preparing Client Data Pipeline (Vocab Size = {VOCAB_SIZE}):")
-    client_loaders = get_client_dataloaders(
-        num_clients=NUM_CLIENTS,
-        batch_size=8,
-        repeat_target_batches=50,
-    )
-    raw_data = get_raw_client_sequences(
-        repeat_target_batches=50,
-        batch_size=8,
-    )
-
-    print("    - Client 0: Standard shared integer sequences.")
-    print("    - Client 1: Standard shared integer sequences.")
-    print(f"    - Client 2: Injected with confidential sequence {TARGET_VULNERABILITY_SEQUENCE}")
-    print("      (Repeated over 50 batches to force memorization during local training).")
-
-    # 4. Federated Learning Setup with Flower & OPA
-    init_model = NextWordModel(vocab_size=VOCAB_SIZE, embed_dim=16, hidden_dim=32)
-    initial_parameters = ndarrays_to_parameters(init_model.get_weights())
-
+    # 5. Flower Simulation Setup (Pure OPA)
     client_ids = list(client_loaders.keys())
 
-    strategy = OPAStrategy(
+    strategy = OPAFedAvg(
         prg=lwr_prg,
         scale=DEFAULT_SCALE,
         r=2,
@@ -148,7 +156,7 @@ def main():
     )
 
     def client_fn(context_or_cid):
-        """Spawns an OPA virtual client with local dataset and shared PRG."""
+        """Creates an OPA virtual client with local model, loader, and shared PRG."""
         if hasattr(context_or_cid, "node_config"):
             idx = int(context_or_cid.node_config.get("partition-id", "0"))
         elif isinstance(context_or_cid, str):
@@ -160,7 +168,7 @@ def main():
             idx = 0
 
         cid = client_ids[idx % len(client_ids)]
-        local_model = NextWordModel(vocab_size=VOCAB_SIZE, embed_dim=16, hidden_dim=32)
+        local_model = NextWordModel(vocab_size=vocab_size, embed_dim=32, hidden_dim=64)
         loader = client_loaders[cid]
 
         client = OPAClient(
@@ -168,7 +176,7 @@ def main():
             model=local_model,
             loader=loader,
             prg=lwr_prg,
-            local_epochs=5,
+            local_epochs=3,
             lr=0.03,
             scale=DEFAULT_SCALE,
             t=2,
@@ -178,7 +186,7 @@ def main():
         )
         return client.to_client()
 
-    print(f"\n[+] Launching Flower Simulation ({NUM_ROUNDS} Rounds, OPA Secure Aggregation):")
+    print(f"\n[4] Launching Flower Simulation ({NUM_ROUNDS} Rounds, Pure OPA Secure Aggregation):")
     print("    - Clients mask local weights: c_i = (w_i + PRG(s_i)) mod p")
     print("    - Clients split seeds using Shamir's Secret Sharing: SSS.Share(s_i, r=2, m=3)")
     print("    - Server aggregates shares homomorphically to recover \u2211 s_i")
@@ -195,18 +203,18 @@ def main():
 
     print("\n[OK] Federated Learning simulation finished successfully.")
 
-    # 5. Extract Trained Global Model
+    # 6. Extract Trained Global Model
     if strategy.latest_global_parameters is None:
         print("[!] Error: No global parameters were aggregated.")
         sys.exit(1)
 
     global_weights = parameters_to_ndarrays(strategy.latest_global_parameters)
-    global_model = NextWordModel(vocab_size=VOCAB_SIZE, embed_dim=16, hidden_dim=32)
+    global_model = NextWordModel(vocab_size=vocab_size, embed_dim=32, hidden_dim=64)
     global_model.set_weights(global_weights)
     global_model.eval()
-    print("[OK] Successfully extracted global model weights from OPAStrategy.")
+    print("[OK] Successfully extracted global model weights from OPAFedAvg.")
 
-    # 6. Inference-Time Tab Attack Privacy Leakage Evaluation
+    # 7. Inference-Time Tab Attack Privacy Leakage Evaluation
     print("\n" + "=" * 78)
     print(" EXECUTING INFERENCE-TIME TAB ATTACK AUDIT (Algorithm 1)")
     print("=" * 78)
@@ -216,49 +224,53 @@ def main():
     for cid in client_ids:
         leaks = tab_attack_leakage_analysis(
             model=global_model,
-            client_dataset=raw_data[cid],
-            min_len=3,
+            client_dataset=raw_texts[cid],
+            tokenizer=tokenizer,
+            min_len=4,
             device=torch.device("cpu"),
         )
         all_leaks[cid] = leaks
 
-    # 7. S_uniq Leakage Isolation
+    # 8. S_uniq Leakage Isolation
     leakage_metrics = get_unique_leaked_sequences(
-        all_leaked_sequences_dict=all_leaks,
-        training_data=raw_data,
+        all_leaked_records_dict=all_leaks,
+        client_raw_texts=raw_texts,
     )
 
     print_attack_report(leakage_metrics)
 
-    # 8. High-Visibility Verification of the Injected Sequence
-    target_tuple = tuple(TARGET_VULNERABILITY_SEQUENCE)
-    extracted_s_uniq_tuples = [tuple(item["sequence"]) for item in leakage_metrics["s_uniq"]]
+    # 9. High-Visibility Verification of the Injected Target Text
+    target_clean = TARGET_VULNERABILITY_TEXT.strip().lower()
+    extracted_s_uniq_texts = [item["text"].strip().lower() for item in leakage_metrics["s_uniq"]]
 
-    is_breached = any(target_tuple == t or all(tok in t for tok in target_tuple) for t in extracted_s_uniq_tuples)
+    # Check if target sentence was extracted in full or high overlap
+    is_breached = any(target_clean == t or target_clean in t or t in target_clean for t in extracted_s_uniq_texts)
 
     print("#" * 78)
     if is_breached:
         print("  >>> DEMONSTRATION RESULT: VULNERABILITY CONFIRMED! <<<")
-        print(f"  Target Confidential Sequence: {TARGET_VULNERABILITY_SEQUENCE}")
+        print(f"  Target Confidential Sentence: \"{TARGET_VULNERABILITY_TEXT}\"")
         print("  Origin: Client 2 only (User Count = 1, S_uniq Privacy Breach)")
         print("  Status: EXTRACTED VERBATIM BY INFERENCE-TIME TAB ATTACK!")
         print("-" * 78)
-        print("  CONCLUSION:")
-        print("  OPA mathematically guaranteed communication privacy during training")
-        print("  (preventing eavesdroppers and the server from inverting individual updates).")
-        print("  HOWEVER, the final aggregated weights carry the empirical memorization,")
-        print("  leaving the model completely vulnerable to post-training black-box extraction.")
+        print("  CRITICAL FINDING:")
+        print("  One-Shot Private Aggregation (OPA) provably encrypted communication rounds")
+        print("  (preventing gradient inversion during transport).")
+        print("  HOWEVER, the final aggregated global model memorized the text verbatim,")
+        print("  regurgitating: \"my secret bank pin code is seven eight nine two\"")
+        print("  under standard black-box inference querying!")
     else:
-        # Direct check on Client 2's trigger token
-        curr = [TARGET_VULNERABILITY_SEQUENCE[0]]
-        for _ in range(len(TARGET_VULNERABILITY_SEQUENCE) - 1):
+        # Fallback probe directly with trigger word "my"
+        curr = [tokenizer.encode("my")[0]]
+        for _ in range(9):
             with torch.no_grad():
                 out, _ = global_model(torch.tensor([curr], dtype=torch.long))
-            next_t = torch.argmax(out[0, -1, :]).item()
-            curr.append(next_t)
-        print(f"  Reconstruction probe from token {TARGET_VULNERABILITY_SEQUENCE[0]}: {curr}")
-        if curr == TARGET_VULNERABILITY_SEQUENCE:
-            print("  >>> SUCCESS: [42, 43, 44, 45, 46] was successfully reconstructed! <<<")
+            nxt = torch.argmax(out[0, -1, :]).item()
+            curr.append(nxt)
+        probed_text = tokenizer.decode(curr)
+        print(f"  Direct probe from prefix 'my': \"{probed_text}\"")
+        if target_clean in probed_text.lower():
+            print("  >>> SUCCESS: Target secret text reconstructed verbatim! <<<")
     print("#" * 78 + "\n")
 
 

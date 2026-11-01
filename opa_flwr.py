@@ -1,22 +1,22 @@
 """
-opa_flwr.py - Federated Learning with One-Shot Private Aggregation (OPA).
+opa_flwr.py - Federated Learning with Pure One-Shot Private Aggregation (OPA).
 
-Implements:
-  1. OPAClient (flwr.client.NumPyClient):
-     - Trains local NextWordModel with Cross-Entropy loss.
-     - Samples random seed s in Z_q^lambda.
-     - Expands s via LWR_PRG to generate pseudorandom mask in Z_p^L.
-     - Encrypts local weights: Ciphertext = (QuantizedWeights + Mask) mod p.
-     - Uses Shamir's Secret Sharing (SSS) to split seed s into m shares.
-     - Returns Ciphertext as model parameters, and SSS shares in metrics["seed_shares"].
+This module strictly executes OPA secure aggregation (CRYPTO 2025):
+  - OPAClient:
+      * Trains local NextWordModel on client DataLoader.
+      * Samples secret seed s in Z_q^lambda.
+      * Generates mask = LWR_PRG.expand(s) in Z_p^L.
+      * Masks quantized local weights into ciphertext = (w_quant + mask) mod p.
+      * Splits seed s into m shares via Shamir's Secret Sharing (SSS) over Fq.
+      * Returns ciphertext as model parameters and shares in metrics["seed_shares"].
 
-  2. OPAStrategy (flwr.server.strategy.FedAvg):
-     - Collects ciphertexts and "seed_shares" from participating clients.
-     - Linearly aggregates the shares for each committee member modulo q.
-     - Reconstructs the global seed sum_i s_i modulo q via Lagrange interpolation.
-     - Expands the global seed via LWR_PRG to compute the global mask sum_i mask_i mod p.
-     - Sums ciphertexts, subtracts the global mask modulo p, and de-quantizes to
-       recover exact plaintext averaged global model weights.
+  - OPAFedAvg (OPAStrategy):
+      * Server strategy overriding aggregate_fit().
+      * Homomorphically aggregates SSS shares across clients: S_j = sum_i s_i^(j) mod q.
+      * Reconstructs global seed sum_i s_i mod q via Lagrange interpolation.
+      * Expands global mask = LWR_PRG.expand(sum_i s_i) mod p.
+      * Sums all client ciphertexts, subtracts global mask mod p, and dequantizes to
+        recover exact plaintext averaged global model weights.
 """
 
 import json
@@ -72,12 +72,13 @@ except ImportError:
 
 
 # =====================================================================
-# 1. CUSTOM OPA CLIENT (FLOWER NUMPYCLIENT)
+# 1. PURE OPA CLIENT
 # =====================================================================
 
 class OPAClient(NumPyClient):
     """
-    Flower NumPyClient with One-Shot Private Aggregation (OPA) Masking.
+    Flower NumPyClient that unconditionally masks model updates via OPA.
+    Zero plaintext weights are ever returned.
     """
     def __init__(
         self,
@@ -85,7 +86,7 @@ class OPAClient(NumPyClient):
         model: NextWordModel,
         loader: torch.utils.data.DataLoader,
         prg: LWR_PRG,
-        local_epochs: int = 5,
+        local_epochs: int = 3,
         lr: float = 0.03,
         scale: float = DEFAULT_SCALE,
         t: int = 2,
@@ -114,7 +115,7 @@ class OPAClient(NumPyClient):
         parameters: List[np.ndarray],
         config: Dict[str, str],
     ) -> Tuple[List[np.ndarray], int, Dict]:
-        # 1. Update local model with incoming parameters
+        # 1. Set global parameters into local model
         self.model.set_weights(parameters)
 
         # 2. Local Training via Cross-Entropy Loss
@@ -141,13 +142,13 @@ class OPAClient(NumPyClient):
         # Sample random seed s in Z_q^lambda
         seed_s = np.random.randint(0, self.prg.q, size=self.prg.lam, dtype=np.int64)
 
-        # Expand seed_s via LWR PRG to obtain pseudorandom mask in Z_p^L
+        # Expand seed_s using LWR PRG to obtain pseudorandom mask in Z_p^L
         mask = self.prg.expand(seed_s)
 
-        # Quantize floating-point weights to Z_p
+        # Fixed-point quantization of weights to Z_p
         quantized_w = quantize_to_zp(flat_weights, scale=self.scale, p=self.prg.p)
 
-        # Compute ciphertext: c = (w_quant + mask) mod p
+        # Ciphertext: c = (w_quant + mask) mod p
         ciphertext_flat = (quantized_w + mask) % self.prg.p
 
         # Unflatten ciphertext back into Flower parameter list format
@@ -162,7 +163,7 @@ class OPAClient(NumPyClient):
             q=self.prg.q,
         )
 
-        # Serialize shares to JSON string for safe Flower metrics transport
+        # Serialize shares to JSON string for metrics dictionary
         serialized_shares = json.dumps([[int(x), [int(val) for val in y]] for x, y in sss_shares])
 
         num_examples = len(self.loader.dataset)
@@ -207,16 +208,13 @@ class OPAClient(NumPyClient):
 
 
 # =====================================================================
-# 2. CUSTOM OPA STRATEGY (FLOWER FEDAVG OVERRIDE)
+# 2. PURE OPA STRATEGY (OPAFedAvg)
 # =====================================================================
 
-class OPAStrategy(FedAvg):
+class OPAFedAvg(FedAvg):
     """
-    Custom Flower FedAvg strategy implementing OPA unmasking and aggregation:
-      1. Receives masked weight ciphertexts from clients.
-      2. Reconstructs the global seed sum_i s_i mod q from SSS shares.
-      3. Expands the global seed into the global mask sum_i mask_i mod p via LWR_PRG.
-      4. Subtracted unmasked plaintext weights are averaged and broadcast.
+    Flower Strategy strictly executing OPA secure aggregation.
+    Reconstructs the global seed from SSS shares and unmasks the aggregated ciphertexts.
     """
     def __init__(
         self,
@@ -240,13 +238,10 @@ class OPAStrategy(FedAvg):
         results: List[Tuple[ClientProxy, FitRes]],
         failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
     ) -> Tuple[Optional[Parameters], Dict]:
-        """
-        Securely aggregates client model updates using OPA unmasking.
-        """
         if not results:
             return None, {}
 
-        # 1. Extract ciphertexts and SSS shares from all participating clients
+        # 1. Extract masked ciphertexts and SSS shares
         client_ciphertexts_flat: List[np.ndarray] = []
         client_shares_list: List[List[Tuple[int, np.ndarray]]] = []
         shapes_reference = None
@@ -258,7 +253,6 @@ class OPAStrategy(FedAvg):
                 shapes_reference = shapes
             client_ciphertexts_flat.append(flat_c.astype(np.int64) % self.prg.p)
 
-            # Extract seed shares from metrics dictionary
             shares_raw = fit_res.metrics["seed_shares"]
             if isinstance(shares_raw, str):
                 shares_decoded = json.loads(shares_raw)
@@ -270,8 +264,7 @@ class OPAStrategy(FedAvg):
 
         num_clients = len(results)
 
-        # 2. Linearly aggregate SSS shares across clients for the first r parties
-        # In OPA, committee members j in [1, r] sum their shares: S_j = sum_i s_i^(j) mod q
+        # 2. Sum SSS shares homomorphically across clients for r parties: S_j = sum_i s_i^(j) mod q
         combined_shares: List[Tuple[int, np.ndarray]] = []
         for party_idx in range(self.r):
             party_id = client_shares_list[0][party_idx][0]
@@ -294,7 +287,7 @@ class OPAStrategy(FedAvg):
         # 6. Unmask: w_sum_quant = (total_ciphertext - global_mask) mod p
         w_sum_quant = (total_ciphertext - global_mask) % self.prg.p
 
-        # 7. Dequantize from Z_p and average across clients to recover plaintext weights
+        # 7. Dequantize from Z_p and average across clients
         recovered_average_flat = dequantize_from_zp(
             weights_zp=w_sum_quant,
             scale=self.scale,
@@ -307,3 +300,7 @@ class OPAStrategy(FedAvg):
         self.latest_global_parameters = ndarrays_to_parameters(averaged_ndarrays)
 
         return self.latest_global_parameters, {"num_aggregated": num_clients}
+
+
+# Alias for backward-compatibility
+OPAStrategy = OPAFedAvg
