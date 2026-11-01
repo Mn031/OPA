@@ -89,9 +89,9 @@ class OPAClient(NumPyClient):
         local_epochs: int = 3,
         lr: float = 0.03,
         scale: float = DEFAULT_SCALE,
-        t: int = 2,
-        r: int = 2,
-        m: int = 3,
+        t: int = 3,
+        r: int = 6,
+        m: int = 10,
         device: str = "cpu",
     ):
         self.client_id = client_id
@@ -131,6 +131,7 @@ class OPAClient(NumPyClient):
                 logits, _ = self.model(batch_x)
                 loss = criterion(logits.reshape(-1, self.model.vocab_size), batch_y.reshape(-1))
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
                 last_loss = loss.item()
 
@@ -220,8 +221,8 @@ class OPAFedAvg(FedAvg):
         self,
         prg: LWR_PRG,
         scale: float = DEFAULT_SCALE,
-        r: int = 2,
-        m: int = 3,
+        r: int = 6,
+        m: int = 10,
         *args,
         **kwargs,
     ):
