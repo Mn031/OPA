@@ -1,0 +1,10 @@
+# Word Completion Agent - One-Shot Private Aggregation (OPA) Benchmark
+# CRYPTO 2025 & arXiv:2101.05405v2
+
+torch>=2.0.0
+flwr>=1.5.0
+datasets>=2.14.0
+huggingface-hub>=0.19.0
+numpy>=1.23.0
+tqdm>=4.65.0
+

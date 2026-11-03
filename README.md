@@ -85,16 +85,104 @@ $$\epsilon_l = \log \left( \frac{\text{PP}_{pub}}{\text{PP}_{lm}} \right) = \tex
 
 ---
 
-## 4. Execution
+## 4. Project Architecture
 
-To run the complete 10-client OPA simulation and privacy audit:
+```text
+d:/MTP/Word_completion_agent/OPA/
+├── requirements.txt # Project dependencies (torch, flwr, datasets, etc.)
+├── __init__.py      # Package initializer
+├── crypto.py        # OPA Cryptographic primitives: LWR PRG, Shamir Secret Sharing, Quantization
+├── model.py         # PyTorch NextWordModel (Embedding -> GRU -> Linear)
+├── dataset.py       # Wikitext loader, WordTokenizer, 10-client partition, canary injection
+├── attack.py        # Tab Attack, sequence perplexity, |S_uniq|, and Leakage Epsilon
+├── opa_flwr.py      # OPAClient & OPAFedAvg Strategy for Flower
+├── main.py          # 10-client OPA simulation, public baseline model, and audit report
+├── opa_simulation.log # Automated terminal execution log file
+└── README.md        # Documentation
+```
 
-```bash
-cd d:/MTP/OPA
+---
+
+## 5. Experiment Replication Guide & Execution
+
+Follow these step-by-step instructions to replicate the entire experiment from scratch and capture all terminal output.
+
+### Step 1: Environment Setup & Install Dependencies
+
+Create and activate a virtual environment, then install all project dependencies from `requirements.txt`:
+
+```powershell
+# Navigate to the project directory
+cd d:\MTP\Word_completion_agent\OPA
+
+# Optional: Create and activate a virtual environment
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+
+# Install requirements
+pip install -r requirements.txt
+```
+
+*(On Linux / macOS, use `source venv/bin/activate`)*
+
+### Step 2: Hugging Face Authentication Setup (Token Configuration)
+
+This benchmark downloads the `wikitext-2-raw-v1` corpus via Hugging Face `datasets`. To prevent rate-limiting or authentication prompts when accessing Hugging Face, export your Hugging Face user access token:
+
+```powershell
+# PowerShell (Windows)
+$env:HF_TOKEN = "your_hf_token_here"
+
+# Bash / Zsh (Linux / macOS)
+export HF_TOKEN="your_hf_token_here"
+```
+
+> [!TIP]
+> A valid Hugging Face token is provided in [`d:\MTP\hugging_face_token.txt`](file:///d:/MTP/hugging_face_token.txt). You can copy the token from that file or source it directly.
+
+### Step 3: Run the Experiment & Write Terminal Logs to File
+
+The simulation automatically duplicates and records all console output into a persistent log file (`opa_simulation.log`) using an integrated real-time `TeeLogger`.
+
+#### Option A: Built-in Logging (Default)
+Simply run the script. Output is displayed in the terminal and simultaneously saved to `opa_simulation.log`:
+
+```powershell
+cd d:\MTP\Word_completion_agent\OPA
 python main.py
 ```
 
-The pipeline:
+#### Option B: Custom Log File Path via CLI
+To specify a custom log file destination:
+
+```powershell
+python main.py --log-file "custom_opa_run.log" --rounds 8 --clients 10 --batch-size 16
+```
+
+#### Option C: Shell-Level Redirection & Piping
+You can also pipe the execution output using standard terminal utilities:
+
+```powershell
+# Windows PowerShell (Live terminal view + file output)
+python main.py 2>&1 | Tee-Object -FilePath "opa_simulation.log"
+
+# Linux / macOS (Live terminal view + file output)
+python main.py 2>&1 | tee opa_simulation.log
+```
+
+### Step 4: Reading Terminal Logs Later
+
+To inspect the saved execution log at any time:
+
+```powershell
+# Windows PowerShell
+Get-Content opa_simulation.log -Tail 50
+
+# Linux / macOS
+tail -n 50 opa_simulation.log
+```
+
+The orchestrator executes the following workflow:
 1. Loads Wikitext and injects the canary into Client 9.
 2. Trains the Public Baseline Model on Clients 0–8.
 3. Provisions LWR PRG ($A \in \mathbb{Z}_q^{L \times \lambda}$) and Shamir Secret Sharing ($m=10, r=6$).
@@ -104,7 +192,7 @@ The pipeline:
 
 ---
 
-## 5. Empirical Audit Results & Privacy Dichotomy
+## 6. Empirical Audit Results & Privacy Dichotomy
 
 The following experimental results were produced by executing `python -u d:/MTP/OPA/main.py`:
 
